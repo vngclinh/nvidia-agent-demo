@@ -1,0 +1,31 @@
+# Assignment 4 — NeMo Agent Toolkit (NAT) Workflow
+# Module 05 pattern: mcp_client + nim LLM + react_agent
+#
+# Chạy:
+#   1. Start invoice MCP server: python mcp-servers/invoice/src/mcp_server_invoice/server_http.py
+#   2. nat run --config_file workflow.yaml --input "Search invoices for Leonie Kohler"
+
+function_groups:
+  mcp_invoice:
+    _type: mcp_client
+    server:
+      transport: streamable-http
+      url: "http://127.0.0.1:${MCP_PORT:-8765}/mcp/"
+
+llms:
+  nim_llm:
+    _type: nim
+    model_name: meta/llama-3.3-70b-instruct
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: ${NVIDIA_API_KEY}
+    temperature: 0.6
+    top_p: 0.95
+    max_tokens: 1024
+
+workflow:
+  _type: react_agent
+  tool_names:
+    - mcp_invoice
+  llm_name: nim_llm
+  verbose: true
+  parse_agent_response_max_retries: 3

@@ -1,0 +1,7 @@
+# Bí mật — KHÔNG commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
