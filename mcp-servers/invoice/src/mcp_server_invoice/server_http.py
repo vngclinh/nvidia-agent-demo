@@ -110,48 +110,83 @@ def _invoice_search(args: dict) -> list[types.TextContent]:
     artist_or_track = args.get("artist_or_track", "")
     pattern = f"%{customer_query}%"
 
-    sql = """
-        SELECT
-            i.InvoiceId,
-            i.InvoiceDate,
-            i.Total,
-            c.FirstName || ' ' || c.LastName AS CustomerName,
-            c.Phone,
-            c.Email,
-            il.InvoiceLineId,
-            il.UnitPrice,
-            il.Quantity,
-            t.Name  AS TrackName,
-            ar.Name AS ArtistName,
-            al.Title AS AlbumTitle
-        FROM Invoice i
-        JOIN Customer c ON i.CustomerId = c.CustomerId
-        JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
-        JOIN Track t ON il.TrackId = t.TrackId
-        JOIN Album al ON t.AlbumId = al.AlbumId
-        JOIN Artist ar ON al.ArtistId = ar.ArtistId
-        WHERE (c.FirstName LIKE ? OR c.LastName LIKE ?
-               OR c.FirstName || ' ' || c.LastName LIKE ?
-               OR c.Phone LIKE ?)
-    """
-    params: list[Any] = [pattern, pattern, pattern, pattern]
-
-    if artist_or_track:
-        art_pattern = f"%{artist_or_track}%"
-        sql += " AND (ar.Name LIKE ? OR t.Name LIKE ?)"
-        params += [art_pattern, art_pattern]
-
-    sql += " ORDER BY i.InvoiceId, il.InvoiceLineId"
-
     try:
         conn = get_db()
+
+        # ── 1) Khách hàng có tồn tại không? ─────────────────────────────────────
+        cust_rows = conn.execute(
+            """
+            SELECT CustomerId,
+                   FirstName || ' ' || LastName AS CustomerName,
+                   Phone, Email
+            FROM Customer
+            WHERE FirstName LIKE ? OR LastName LIKE ?
+               OR FirstName || ' ' || LastName LIKE ?
+               OR Phone LIKE ?
+            ORDER BY CustomerId
+            """,
+            [pattern, pattern, pattern, pattern],
+        ).fetchall()
+
+        if not cust_rows:
+            conn.close()
+            return [types.TextContent(
+                type="text",
+                text=f"No customer found matching '{customer_query}'.",
+            )]
+
+        # ── 2) Lấy hóa đơn (LEFT JOIN để hóa đơn đã refund — không còn dòng — vẫn hiện) ─
+        sql = """
+            SELECT
+                i.InvoiceId,
+                i.InvoiceDate,
+                i.Total,
+                c.FirstName || ' ' || c.LastName AS CustomerName,
+                c.Phone,
+                c.Email,
+                il.InvoiceLineId,
+                il.UnitPrice,
+                il.Quantity,
+                t.Name  AS TrackName,
+                ar.Name AS ArtistName,
+                al.Title AS AlbumTitle
+            FROM Invoice i
+            JOIN Customer c ON i.CustomerId = c.CustomerId
+            LEFT JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
+            LEFT JOIN Track t ON il.TrackId = t.TrackId
+            LEFT JOIN Album al ON t.AlbumId = al.AlbumId
+            LEFT JOIN Artist ar ON al.ArtistId = ar.ArtistId
+            WHERE (c.FirstName LIKE ? OR c.LastName LIKE ?
+                   OR c.FirstName || ' ' || c.LastName LIKE ?
+                   OR c.Phone LIKE ?)
+        """
+        params: list[Any] = [pattern, pattern, pattern, pattern]
+
+        if artist_or_track:
+            # Lọc theo artist/track: chỉ giữ hóa đơn còn dòng khớp.
+            # Hóa đơn đã refund (không còn dòng) sẽ không khớp filter này — đúng ý nghĩa.
+            art_pattern = f"%{artist_or_track}%"
+            sql += " AND (ar.Name LIKE ? OR t.Name LIKE ?)"
+            params += [art_pattern, art_pattern]
+
+        sql += " ORDER BY i.InvoiceId, il.InvoiceLineId"
+
         rows = conn.execute(sql, params).fetchall()
         conn.close()
     except Exception as e:
         return [types.TextContent(type="text", text=f"Database error: {e}")]
 
+    # ── 3) Khách hàng tồn tại nhưng không có hóa đơn (khớp tiêu chí) ────────────
     if not rows:
-        return [types.TextContent(type="text", text="No invoices found for that customer.")]
+        names = ", ".join(r["CustomerName"] for r in cust_rows)
+        if artist_or_track:
+            msg = (
+                f"Customer found ({names}) but no invoices match "
+                f"artist/track '{artist_or_track}'."
+            )
+        else:
+            msg = f"Customer found ({names}) but has no invoices."
+        return [types.TextContent(type="text", text=msg)]
 
     # Group by invoice
     invoices: dict[int, dict] = {}
@@ -167,18 +202,23 @@ def _invoice_search(args: dict) -> list[types.TextContent]:
                 "email": row["Email"],
                 "lines": [],
             }
-        invoices[inv_id]["lines"].append({
-            "track": row["TrackName"],
-            "artist": row["ArtistName"],
-            "album": row["AlbumTitle"],
-            "price": row["UnitPrice"],
-            "qty": row["Quantity"],
-        })
+        # LEFT JOIN có thể trả dòng rỗng (InvoiceLineId NULL) cho hóa đơn đã refund.
+        if row["InvoiceLineId"] is not None:
+            invoices[inv_id]["lines"].append({
+                "track": row["TrackName"],
+                "artist": row["ArtistName"],
+                "album": row["AlbumTitle"],
+                "price": row["UnitPrice"],
+                "qty": row["Quantity"],
+            })
 
     result_lines = []
     for inv in invoices.values():
+        # Hóa đơn không còn dòng nào ⇒ đã được hoàn tiền.
+        refunded = len(inv["lines"]) == 0
+        status = "  [REFUNDED — no items]" if refunded else ""
         result_lines.append(
-            f"Invoice #{inv['invoice_id']} | {inv['date']} | Total: ${inv['total']:.2f}\n"
+            f"Invoice #{inv['invoice_id']} | {inv['date']} | Total: ${inv['total']:.2f}{status}\n"
             f"  Customer: {inv['customer']} | {inv['phone']} | {inv['email']}"
         )
         for line in inv["lines"]:
@@ -206,6 +246,18 @@ def _invoice_refund(args: dict) -> list[types.TextContent]:
             return [types.TextContent(type="text", text=f"Error: Invoice #{invoice_id} not found.")]
 
         original_total = row["Total"]
+
+        # Đã refund trước đó? (không còn dòng nào & total = 0) → báo rõ, không refund lại.
+        line_count = conn.execute(
+            "SELECT COUNT(*) FROM InvoiceLine WHERE InvoiceId = ?", [invoice_id]
+        ).fetchone()[0]
+        if line_count == 0 and (original_total or 0) == 0:
+            conn.close()
+            return [types.TextContent(
+                type="text",
+                text=f"Invoice #{invoice_id} has already been refunded "
+                     f"(total is $0.00, no items remaining).",
+            )]
 
         conn.execute("DELETE FROM InvoiceLine WHERE InvoiceId = ?", [invoice_id])
         conn.execute("UPDATE Invoice SET Total = 0.0 WHERE InvoiceId = ?", [invoice_id])
